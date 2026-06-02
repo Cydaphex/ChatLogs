@@ -1,0 +1,11 @@
+# Runtime data files — these contain personal chat/whisper history and
+# per-user settings written by the addon at runtime. Never publish them.
+data.lua
+channels.lua
+export_*.lua
+
+# Editor / OS noise
+*.bak
+*.tmp
+Thumbs.db
+desktop.ini
