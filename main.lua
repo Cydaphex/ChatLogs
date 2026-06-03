@@ -220,6 +220,7 @@ local pos = {
 -- ============================================================================
 local DATA_PATH      = "ChatLogs/data.lua"
 local CHANNELS_PATH  = "ChatLogs/channels.lua"
+local SETTINGS_ID    = "ChatLogs"
 local saveDirty      = false
 local savePending    = false
 local inCombat       = false  -- set by UNIT_COMBAT_STATE_CHANGED; defers saves
@@ -253,6 +254,10 @@ local function SaveData()
     })
     if ok then
         saveDirty = false
+        local store = api.GetSettings(SETTINGS_ID)
+        if store and not store.dataExists then
+            store.dataChecked = true; store.dataExists = true; api.SaveSettings()
+        end
     elseif not saveErrorLogged then
         -- Log at most once per session; leave saveDirty=true so it retries quietly.
         saveErrorLogged = true
@@ -264,6 +269,10 @@ local function SaveChannels()
     local ok, err = pcall(api.File.Write, api.File, CHANNELS_PATH, { channels = channels })
     if ok then
         channelsDirty = false
+        local store = api.GetSettings(SETTINGS_ID)
+        if store and not store.channelsExists then
+            store.channelsChecked = true; store.channelsExists = true; api.SaveSettings()
+        end
     elseif not saveErrorLogged then
         saveErrorLogged = true
         api.Log:Err("[ChatLogs] Channel save failed: " .. tostring(err))
@@ -300,10 +309,24 @@ local function OnPeriodicSave(dt)
 end
 
 local function LoadData()
+    -- Reading a file that doesn't exist makes the addon manager log a "file not
+    -- found" message every session. We record in the manager's settings store
+    -- whether the data file exists and only read when it does. The first run does
+    -- a one-time read to migrate any pre-existing file, then remembers the result
+    -- so later runs stay silent. (api.GetSettings never touches disk.)
+    local store = api.GetSettings(SETTINGS_ID)
+    if store and store.dataChecked and not store.dataExists then
+        return
+    end
     local ok, data = pcall(function() return api.File:Read(DATA_PATH) end)
-    if not ok or type(data) ~= "table" then
-        -- No save file yet (normal on first run) or unreadable — start fresh,
-        -- silently. This is not an error worth spamming the player's chat.
+    local exists = ok and type(data) == "table"
+    if store and (not store.dataChecked or store.dataExists ~= exists) then
+        store.dataChecked = true
+        store.dataExists = exists
+        api.SaveSettings()
+    end
+    if not exists then
+        -- No save file yet (normal on first run) or unreadable — start fresh.
         return
     end
     if type(data.conversations) == "table" then
@@ -340,8 +363,18 @@ local function LoadData()
 end
 
 local function LoadChannels()
+    local store = api.GetSettings(SETTINGS_ID)
+    if store and store.channelsChecked and not store.channelsExists then
+        return
+    end
     local ok, data = pcall(function() return api.File:Read(CHANNELS_PATH) end)
-    if not ok or type(data) ~= "table" or type(data.channels) ~= "table" then
+    local exists = ok and type(data) == "table" and type(data.channels) == "table"
+    if store and (not store.channelsChecked or store.channelsExists ~= exists) then
+        store.channelsChecked = true
+        store.channelsExists = exists
+        api.SaveSettings()
+    end
+    if not exists then
         return  -- start empty; channels already initialized in DATA MODEL
     end
     for _, key in ipairs(CHANNEL_ORDER) do
@@ -1323,7 +1356,7 @@ end
 local addon = {
     name    = "ChatLogs",
     author  = "Cydaphex",
-    version = "1.2.0",
+    version = "1.3.0",
     desc    = "Whisper + channel chat logging with notifications and history."
 }
 
