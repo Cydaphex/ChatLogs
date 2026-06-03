@@ -309,11 +309,11 @@ local function OnPeriodicSave(dt)
 end
 
 local function LoadData()
-    -- Reading a file that doesn't exist makes the addon manager log a "file not
-    -- found" message every session. We record in the manager's settings store
-    -- whether the data file exists and only read when it does. The first run does
-    -- a one-time read to migrate any pre-existing file, then remembers the result
-    -- so later runs stay silent. (api.GetSettings never touches disk.)
+    -- Reading a file that doesn't exist produces a "file not found" message every
+    -- session. We record in the addon's saved settings (api.GetSettings, part of
+    -- the ArcheAge addon API) whether the data file exists, and only read when it
+    -- does. The first run does a one-time read to migrate any pre-existing file,
+    -- then remembers the result so later runs stay silent.
     local store = api.GetSettings(SETTINGS_ID)
     if store and store.dataChecked and not store.dataExists then
         return
