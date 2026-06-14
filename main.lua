@@ -170,7 +170,10 @@ for _, key in ipairs(CHANNEL_ORDER) do
     channels[key] = { messages = {}, unreadCount = 0 }
 end
 local activeTab = "whispers"  -- "whispers" or a channel key
-local channelsDirty = false   -- set true on channel change; drives SaveChannels
+local channelsDirty = false   -- any channel has unsaved data (gates the timer)
+local channelDirty  = {}      -- [key] = true: this channel changed since last save
+local savedActive   = {}      -- [key] = index of the last chunk written to disk
+for _, key in ipairs(CHANNEL_ORDER) do channelDirty[key] = false; savedActive[key] = 0 end
 local searchText = ""         -- active-view search filter
 local searchBox               -- search edit widget (created in CreateHistoryWindow)
 
@@ -265,8 +268,48 @@ local function SaveData()
     end
 end
 
+-- Channels are stored as append-only chunks so a save never re-serializes the
+-- whole history. Each channel's messages are split into SEG_SIZE-message chunk
+-- files; sealed (full) chunks are never rewritten, and a save only rewrites the
+-- one small "active" (last, partial) chunk plus any chunk newly sealed since the
+-- last save. CHANNELS_PATH is a tiny manifest of per-channel chunk counts.
+local SEG_SIZE = 500
+local function ChunkPath(key, i) return "ChatLogs/chan_" .. key .. "_" .. i .. ".lua" end
+
 local function SaveChannels()
-    local ok, err = pcall(api.File.Write, api.File, CHANNELS_PATH, { channels = channels })
+    local wroteAnything = false
+    for _, key in ipairs(CHANNEL_ORDER) do
+        if channelDirty[key] then
+            local msgs = channels[key].messages
+            local n = #msgs
+            local curActive = (n == 0) and 0 or math.ceil(n / SEG_SIZE)
+            local writeOk = true
+            -- Rewrite from the previously-active chunk (it may have gained
+            -- messages and/or sealed) through the current active chunk.
+            local fromChunk = math.max(1, savedActive[key])
+            for i = fromChunk, curActive do
+                local startIdx = (i - 1) * SEG_SIZE + 1
+                local endIdx   = math.min(i * SEG_SIZE, n)
+                local slice = {}
+                for j = startIdx, endIdx do slice[#slice + 1] = msgs[j] end
+                local ok = pcall(api.File.Write, api.File, ChunkPath(key, i), { msgs = slice })
+                if not ok then writeOk = false; break end
+            end
+            if writeOk then
+                savedActive[key] = curActive
+                channelDirty[key] = false
+                wroteAnything = true
+            end
+        end
+    end
+
+    -- Write the manifest (chunk counts + unread counts). Small + cheap.
+    local segs, unread = {}, {}
+    for _, key in ipairs(CHANNEL_ORDER) do
+        segs[key]   = savedActive[key] or 0
+        unread[key] = channels[key].unreadCount or 0
+    end
+    local ok, err = pcall(api.File.Write, api.File, CHANNELS_PATH, { segs = segs, unread = unread })
     if ok then
         channelsDirty = false
         local store = api.GetSettings(SETTINGS_ID)
@@ -368,7 +411,7 @@ local function LoadChannels()
         return
     end
     local ok, data = pcall(function() return api.File:Read(CHANNELS_PATH) end)
-    local exists = ok and type(data) == "table" and type(data.channels) == "table"
+    local exists = ok and type(data) == "table"
     if store and (not store.channelsChecked or store.channelsExists ~= exists) then
         store.channelsChecked = true
         store.channelsExists = exists
@@ -377,12 +420,35 @@ local function LoadChannels()
     if not exists then
         return  -- start empty; channels already initialized in DATA MODEL
     end
-    for _, key in ipairs(CHANNEL_ORDER) do
-        local saved = data.channels[key]
-        if type(saved) == "table" and type(saved.messages) == "table" then
-            channels[key].messages    = saved.messages
-            channels[key].unreadCount = saved.unreadCount or 0
+
+    if type(data.segs) == "table" then
+        -- New chunked format: reassemble each channel from its chunk files.
+        for _, key in ipairs(CHANNEL_ORDER) do
+            local nseg = tonumber(data.segs[key]) or 0
+            local msgs = {}
+            for i = 1, nseg do
+                local ok2, chunk = pcall(function() return api.File:Read(ChunkPath(key, i)) end)
+                if ok2 and type(chunk) == "table" and type(chunk.msgs) == "table" then
+                    for _, m in ipairs(chunk.msgs) do msgs[#msgs + 1] = m end
+                end
+            end
+            channels[key].messages    = msgs
+            channels[key].unreadCount = (data.unread and data.unread[key]) or 0
+            savedActive[key]          = nseg
         end
+    elseif type(data.channels) == "table" then
+        -- Migrate the old single-file format: load into memory and mark dirty so
+        -- the next save rewrites it as chunks (one-time).
+        for _, key in ipairs(CHANNEL_ORDER) do
+            local saved = data.channels[key]
+            if type(saved) == "table" and type(saved.messages) == "table" then
+                channels[key].messages    = saved.messages
+                channels[key].unreadCount = saved.unreadCount or 0
+            end
+            savedActive[key] = 0
+            channelDirty[key] = true
+        end
+        channelsDirty = true
     end
 end
 
@@ -487,6 +553,7 @@ local function OnChannelMessage(key, speaker, text)
             end
         end
         channelsDirty = true
+        channelDirty[key] = true
         if UpdateWarning then UpdateWarning() end
     end)
     if not ok then api.Log:Err("[CL] OnChannelMessage error: " .. tostring(err)) end
@@ -824,8 +891,14 @@ local function CreateHistoryWindow()
     end)
 end
 
--- Tab bar refresh: re-packs visible tabs (no gaps), then updates labels,
--- unread badges, and active highlight.
+-- Compact unread badge: caps at "99+" so huge counts don't blow out the tab.
+local function FmtUnread(n)
+    if n > 99 then return "99+" end
+    return tostring(n)
+end
+
+-- Tab bar refresh: re-packs visible tabs (no gaps, width sized to fit them all),
+-- then updates labels, unread badges, and active highlight.
 local tabLayoutSig = nil
 UpdateTabBar = function()
     if not tabButtons then return end
@@ -837,9 +910,22 @@ UpdateTabBar = function()
     end
     if sig ~= tabLayoutSig then
         tabLayoutSig = sig
+        -- Width adapts to how many tabs are visible so they pack without
+        -- overflowing the bar: wide (readable) when few, narrower when many.
+        local visible = 1
+        for _, key in ipairs(CHANNEL_ORDER) do
+            if channelEnabled[key] then visible = visible + 1 end
+        end
+        local gap   = 2
+        local avail = CONFIG.HIST_W - 8
+        local tabW  = math.floor((avail - gap * (visible - 1)) / visible)
+        if tabW > 92 then tabW = 92 end
+        if tabW < 50 then tabW = 50 end
+
         local prev = tabButtons["whispers"]
         if prev then
             prev:RemoveAllAnchors()
+            prev:SetExtent(tabW, 22)
             prev:AddAnchor("LEFT", tabBar, 4, 0)
             prev:Show(true)
         end
@@ -848,7 +934,8 @@ UpdateTabBar = function()
             if b then
                 if channelEnabled[key] then
                     b:RemoveAllAnchors()
-                    if prev then b:AddAnchor("LEFT", prev, "RIGHT", 2, 0)
+                    b:SetExtent(tabW, 22)
+                    if prev then b:AddAnchor("LEFT", prev, "RIGHT", gap, 0)
                     else b:AddAnchor("LEFT", tabBar, 4, 0) end
                     b:Show(true)
                     prev = b
@@ -866,7 +953,7 @@ UpdateTabBar = function()
             local ch = channels[key]
             local unread = ch and (ch.unreadCount or 0) or 0
             local label = CHANNEL_LABEL[key]
-            if unread > 0 then label = label .. " [" .. unread .. "]" end
+            if unread > 0 then label = label .. " [" .. FmtUnread(unread) .. "]" end
             b:SetText(label)
             local c = (activeTab == key) and CONFIG.COL_GREEN or CONFIG.COL_WHITE
             b:SetTextColor(c[1], c[2], c[3], 1)
@@ -1033,6 +1120,12 @@ local displayLines = {}
 -- Whispers wrap narrower (sidebar takes space); channels use the full width.
 local WHISPER_WRAP_CHARS = 62
 local CHANNEL_WRAP_CHARS = 84
+-- The live view only ever wraps/renders the most recent MAX_VIEW messages of the
+-- active tab. Set generously: display wrapping is O(n) but doesn't crash (only the
+-- old serialize-everything write did, which is gone). This is just a safety bound
+-- against pathological sizes; normal scrollback is unaffected. Full history is
+-- always stored on disk (chunks) and included in exports regardless.
+local MAX_VIEW = 10000
 
 local function WrapMessage(timeStr, prefix, text, col, maxChars)
     local header = "[" .. timeStr .. "] " .. prefix
@@ -1073,7 +1166,10 @@ local function BuildDisplayLines()
     displayLines = {}
     if activeTab == "whispers" then
         if not selectedSender or not conversations[selectedSender] then return end
-        for _, m in ipairs(conversations[selectedSender].messages) do
+        local msgs  = conversations[selectedSender].messages
+        local start = math.max(1, #msgs - MAX_VIEW + 1)
+        for i = start, #msgs do
+            local m = msgs[i]
             local prefix = m.sent and "You: " or ""
             local col    = m.sent and colors.whisperOut or colors.whisperIn
             for _, line in ipairs(WrapMessage(m.timeStr or "--:--", prefix, m.text, col, WHISPER_WRAP_CHARS)) do
@@ -1083,8 +1179,11 @@ local function BuildDisplayLines()
     else
         local ch = channels[activeTab]
         if not ch then return end
-        local col = ColorFor(activeTab)
-        for _, m in ipairs(ch.messages) do
+        local col   = ColorFor(activeTab)
+        local msgs  = ch.messages
+        local start = math.max(1, #msgs - MAX_VIEW + 1)
+        for i = start, #msgs do
+            local m = msgs[i]
             local prefix = (m.speaker or "?") .. ": "
             for _, line in ipairs(WrapMessage(m.timeStr or "--:--", prefix, m.text, col, CHANNEL_WRAP_CHARS)) do
                 table.insert(displayLines, line)
@@ -1253,6 +1352,7 @@ local function CreateFooter()
             else
                 channels[activeTab] = { messages = {}, unreadCount = 0 }
                 channelsDirty = true
+                channelDirty[activeTab] = true  -- chunk save resets this channel to 0 chunks
                 SaveChannels()
             end
             bodyOffset    = 0
@@ -1306,57 +1406,59 @@ local function ShowFeedback(text, isError)
     end)
 end
 
+-- Export is written in bounded pieces (one file per EXPORT_CHUNK entries) so a
+-- large history is never serialized in a single write — that all-at-once write
+-- is what crashes the 32-bit client at high message counts.
+local EXPORT_CHUNK = 1000
 DoExport = function()
     if next(conversations) == nil and TotalChannelLines() == 0 then
         ShowFeedback("Nothing to export", true)
         return
     end
 
-    local exportConvs = {}
+    local stamp = MakeDateString()
+    local seq, buf = 0, {}
+    local writeOk = true
+    local function flush()
+        if #buf == 0 then return end
+        seq = seq + 1
+        local ok = pcall(api.File.Write, api.File,
+            "ChatLogs/export_" .. stamp .. "_" .. seq .. ".lua",
+            { exported = stamp, part = seq, entries = buf })
+        if not ok then writeOk = false end
+        buf = {}
+    end
+
     for _, name in ipairs(senderOrder) do
         local conv = conversations[name]
         if conv then
-            local msgs = {}
             for _, m in ipairs(conv.messages) do
-                table.insert(msgs, {
-                    time = m.timeStr or "--:--",
-                    text = m.text,
-                    sent = m.sent or false,
-                })
+                buf[#buf + 1] = { kind = "whisper", who = name,
+                    time = m.timeStr or "--:--", text = m.text, sent = m.sent or false }
+                if #buf >= EXPORT_CHUNK then flush() end
             end
-            table.insert(exportConvs, { sender = name, messages = msgs })
         end
     end
-
-    local exportChannels = {}
     for _, key in ipairs(CHANNEL_ORDER) do
-        local msgs = {}
         for _, m in ipairs(channels[key].messages) do
-            table.insert(msgs, {
-                time = m.timeStr or "--:--",
-                speaker = m.speaker,
-                text = m.text,
-            })
+            buf[#buf + 1] = { kind = "channel", channel = key, speaker = m.speaker,
+                time = m.timeStr or "--:--", text = m.text }
+            if #buf >= EXPORT_CHUNK then flush() end
         end
-        exportChannels[key] = msgs
     end
+    flush()
 
-    local exported = MakeDateString()
-    local path = "ChatLogs/export_" .. exported .. ".lua"
-
-    api.File:Write(path, {
-        exported      = exported,
-        conversations = exportConvs,
-        channels      = exportChannels,
-    })
-
-    ShowFeedback("Exported!", false)
+    if writeOk then
+        ShowFeedback("Exported " .. seq .. " file(s)", false)
+    else
+        ShowFeedback("Export error", true)
+    end
 end
 
 local addon = {
     name    = "ChatLogs",
     author  = "Cydaphex",
-    version = "1.3.0",
+    version = "1.3.1",
     desc    = "Whisper + channel chat logging with notifications and history."
 }
 

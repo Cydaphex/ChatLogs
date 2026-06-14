@@ -2,7 +2,9 @@
 # per-user settings written by the addon at runtime. Never publish them.
 data.lua
 channels.lua
+chan_*.lua
 export_*.lua
+stress_tmp.lua
 
 # Editor / OS noise
 *.bak
